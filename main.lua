@@ -8,7 +8,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 --────────── CONFIG — แก้ 3 ค่านี้ ──────────
-local WEBHOOK_URL = "https://webhook.site/ce932978-3959-4d7c-b002-44350e34c42c" -- <-- URL ปลายทาง
+local WEBHOOK_URL = "https://sl2.temp-th.net/webhook" -- <-- URL ปลายทาง
 local POST_INTERVAL = 5                                    -- ทุกกี่วินาที
 local TARGET_USERID = "auto"                                -- ★ "auto" = ตรวจจาก LocalPlayer/CreatorId อัตโนมัติ / ใส่เลข UserId เฉพาะเจาะจง / 0 = ทุกคน
 --───────────────────────────────────────────
