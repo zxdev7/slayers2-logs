@@ -1,20 +1,90 @@
 --========================================================
--- Data Exporter v1.0 (Script — วางใน ServerScriptService)
--- เก็บข้อมูล Player (Items + Wen + Lv + Rep) → JSON → POST ทุก 5 วิ
+-- Data Exporter v1.1 (Script — วางใน ServerScriptService)
+-- เก็บข้อมูล Player (Items + Wen + Lv + Rep + Icon URL) → JSON → POST ทุก 5 วิ
 --========================================================
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
---────────── CONFIG — แก้ 2 ค่านี้ ──────────
-local WEBHOOK_URL = "https://example.com/api/player-data" -- <-- URL ปลายทาง
+--────────── CONFIG — แก้ 3 ค่านี้ ──────────
+local WEBHOOK_URL = "https://webhook.site/ce932978-3959-4d7c-b002-44350e34c42c" -- <-- URL ปลายทาง
 local POST_INTERVAL = 5                                    -- ทุกกี่วินาที
+local TARGET_USERID = "auto"                                -- ★ "auto" = ตรวจจาก LocalPlayer/CreatorId อัตโนมัติ / ใส่เลข UserId เฉพาะเจาะจง / 0 = ทุกคน
 --───────────────────────────────────────────
+
+--────────────────────────────────────────
+-- ★ Auto-detect UserId ของเจ้าของเครื่อง — cache ค่าที่ตรวจพบครั้งแรก
+--────────────────────────────────────────
+local DETECTED_USERID: number?  -- nil = ยังไม่ตรวจ, 0 = ตรวจแล้วแต่ไม่พบ
+
+local function getTargetUserId(): number
+    -- cache ถ้าเคยตรวจแล้ว
+    if DETECTED_USERID ~= nil then
+        return DETECTED_USERID
+    end
+
+    -- กรณี 1: ผู้ใช้ใส่เลข UserId ตรงๆ มา
+    if type(TARGET_USERID) == "number" and TARGET_USERID > 0 then
+        DETECTED_USERID = TARGET_USERID
+        print("[Export] ใช้ UserId ที่กำหนดตรงๆ:", DETECTED_USERID)
+        return DETECTED_USERID
+    end
+
+    -- กรณี 2: โหมด auto (string "auto" หรือ number 0)
+    -- ลอง Players.LocalPlayer ก่อน — ใช้ได้เฉพาะฝั่ง client (LocalScript / Executor)
+    -- บน server LocalPlayer จะเป็น nil
+    local LocalPlayer = Players.LocalPlayer
+    if LocalPlayer then
+        DETECTED_USERID = LocalPlayer.UserId
+        print("[Export] Auto-detect สำเร็จ (LocalPlayer):", DETECTED_USERID,
+              "| DisplayName:", LocalPlayer.DisplayName, "| Name:", LocalPlayer.Name)
+        return DETECTED_USERID
+    end
+
+    -- กรณี 3: ฝั่ง server — ใช้ game.CreatorId (เจ้าของ place)
+    -- ตรวจว่า place นี้เป็นของ User หรือ Group ก่อน
+    if game.CreatorType == Enum.CreatorType.User then
+        DETECTED_USERID = game.CreatorId
+        print("[Export] Auto-detect สำเร็จ (game.CreatorId):", DETECTED_USERID)
+        return DETECTED_USERID
+    end
+
+    -- กรณี 4: place เป็นของ Group → ไม่สามารถ auto-detect user คนใดคนหนึ่งได้
+    if game.CreatorType == Enum.CreatorType.Group then
+        warn("[Export] ⚠️ Auto-detect ไม่สำเร็จ — place นี้เป็นของ Group ID:", game.CreatorId)
+        warn("[Export] กรุณาใส่ TARGET_USERID เป็นเลข UserId ตรงๆ (เช่น TARGET_USERID = 123456789)")
+    else
+        warn("[Export] ⚠️ ไม่สามารถตรวจสอบ UserId ได้ — ไม่มี LocalPlayer และ CreatorType =", game.CreatorType)
+    end
+
+    DETECTED_USERID = 0  -- 0 = โหมด "ไม่กรอง" (ทุกคน) — เพื่อความปลอดภัยถ้า auto ล้มเหลว
+    return DETECTED_USERID
+end
+
+--────────────────────────────────────────
+-- ★ กรองเฉพาะเจ้าของบัญชี — คืน true ถ้า player คือเป้าหมาย
+--────────────────────────────────────────
+local function isTargetPlayer(player: Player): boolean
+    local targetId = getTargetUserId()
+    -- targetId == 0 → โหมดไม่กรอง (เก็บข้อมูลทุกคน)
+    if targetId == 0 then
+        return true
+    end
+    return player.UserId == targetId
+end
 
 -- ค่าคงที่จาก gameSettings.lua
 local EXP_PER_LEVEL = 60
 local MAX_LEVEL = 225
+
+-- ★ เพิ่ม: require ItemIcon module (ฝั่ง shared — server ใช้ได้)
+-- ไฟล์นี้อยู่ที่ ReplicatedStorage/CAM/Global/Collectibles/ItemIcon.lua
+-- ฟังก์ชัน ItemIcon.For(player, itemName) → return string "rbxassetid://XXX" หรือ "" ถ้าไม่เจอ
+local ItemIcon = require(ReplicatedStorage:WaitForChild("CAM")
+    :WaitForChild("Global")
+    :WaitForChild("Collectibles")
+    :WaitForChild("ItemIcon"))
 
 --────────────────────────────────────────
 -- Helper
@@ -37,10 +107,29 @@ local function getItemCount(item: Instance): number
     return 1
 end
 
+-- ★ เพิ่ม: แปลง "rbxassetid://XXX" → URL ภาพ thumbnail ของ Roblox
+-- รองรับทั้ง format ใหม่ (rbxassetid://) และ format เก่า (http://www.roblox.com/asset/?id=)
+local function rbxIconToUrl(icon: string?, width: number?, height: number?): string?
+    if not icon or icon == "" then return nil end
+    local assetId = string.match(icon, "rbxassetid://(%d+)")
+    if not assetId then
+        -- ลอง format เก่า: "http://www.roblox.com/asset/?id=XXX"
+        assetId = string.match(icon, "id=(%d+)")
+    end
+    if not assetId then return nil end
+    local w = width or 420
+    local h = height or 420
+    return string.format(
+        "https://thumbnails.roblox.com/v1/assets?assetIds=%s&size=%dx%d&format=Png",
+        assetId, w, h
+    )
+end
+
 --────────────────────────────────────────
--- เก็บข้อมูล: Items → table
+-- เก็บข้อมูล: Items → table (เพิ่ม icon + iconUrl)
 --────────────────────────────────────────
-local function collectItems(inv: Instance): {any}
+-- ★ เพิ่มพารามิเตอร์ player เพื่อส่งให้ ItemIcon.For
+local function collectItems(inv: Instance, player: Player): {any}
     local items = {}
     for _, item in ipairs(inv:GetChildren()) do
         local entry: any = {
@@ -48,6 +137,20 @@ local function collectItems(inv: Instance): {any}
             class = item.ClassName,
             amount = getItemCount(item),
         }
+
+        -- ★ เพิ่ม: ดึง icon จาก catalog (ReplicatedStorage.Items/<Cat>/<Name>.Icon)
+        local ok, iconStr = pcall(function()
+            return ItemIcon.For(player, item.Name)
+        end)
+        if ok and iconStr and iconStr ~= "" then
+            entry.icon = iconStr                       -- "rbxassetid://XXX" (raw string)
+            entry.iconUrl = rbxIconToUrl(iconStr)      -- URL สำหรับดึง thumbnail
+        else
+            -- กรณี item ไม่อยู่ใน catalog (เช่น entry แปลก ๆ) ปล่อยให้ไม่มี field นี้
+            entry.icon = ""
+            entry.iconUrl = nil
+        end
+
         local refine = item:FindFirstChild("RefineLevel")
         if refine and refine:IsA("ValueBase") and refine.Value > 0 then
             entry.refine = refine.Value
@@ -99,17 +202,17 @@ local function collectPlayerData(player: Player): any
         reputation = nil,
     }
 
-    -- Inventory ของ Slot
+    -- ★ Inventory ของ Slot — ส่ง player เข้าไปด้วย
     local inv = slotRoot:FindFirstChild("Inventory")
     local bag = inv and inv:FindFirstChild("Inventory")
     if bag then
-        payload.inventory = collectItems(bag)
+        payload.inventory = collectItems(bag, player)
     end
 
-    -- Account-wide bag
+    -- ★ Account-wide bag — ส่ง player เข้าไปด้วย
     local accInv = safeWaitPath(dataRoot, { "AccountItems", "Inventory" }, 2)
     if accInv then
-        payload.accountItems = collectItems(accInv)
+        payload.accountItems = collectItems(accInv, player)
     end
 
     -- Reputation (per-account → leaderstats)
@@ -164,6 +267,11 @@ end
 -- Loop หลัก: ทำงานต่อเนื่องทุก 5 วินาที ต่อ 1 Player
 --────────────────────────────────────────
 local function startLoop(player: Player)
+    -- ★ กรองเฉพาะเจ้าของบัญชี — ถ้าไม่ใช่ target ให้ข้ามไปเลย
+    if not isTargetPlayer(player) then
+        return
+    end
+
     task.spawn(function()
         -- รอให้ Server สร้าง Data ของผู้เล่นเสร็จก่อน (สูงสุด 30 วิ)
         local ready = safeWaitPath(ReplicatedStorage, { "Player_Service", "Data", player.Name }, 30)
